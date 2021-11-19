@@ -38,7 +38,7 @@ class NYTimesSource(object):
         # Nothing to do
         pass
 
-    def _flatten_iteration(self, input_dict: JSON_TYPE) -> JSON_TYPE:
+    def _flatten(self, input_dict: JSON_TYPE) -> JSON_TYPE:
         """Flatten dictionary with '.' separator"""
         queue: QUEUE = collections.deque([("", input_dict)])
         output_dict: JSON_TYPE = {}
@@ -80,6 +80,7 @@ class NYTimesSource(object):
         date_completed["reference_id"] = date_completed["reference_id"].values.astype(
             str
         )
+        review_status["row"] = review_status["row"].apply(lambda x: str(x).split("."))
 
         return review_status, date_completed
 
@@ -88,30 +89,52 @@ class NYTimesSource(object):
         review_status, date_completed = self._preprocess_data(*self._get_excel_sheets())
 
         excel_dict = {}
+        statuses = []
         article_status = review_status.loc[
             review_status["article_id"] == article["_id"]
         ]
-        if len(article_status) > 1:
-            excel_dict["status.duplicates"] = len(article_status)
-            excel_dict["status.duplicates.reference_id"] = article_status[
-                "reference_id"
-            ].tolist()
 
         if article_status.empty:
             excel_dict.update(article_status.to_dict())
             reference_id = []
         else:
-            excel_dict.update(article_status.tail(1).to_dict("records")[0])
+            article_statuses = article_status["status"].tolist()
             reference_id = article_status["reference_id"].values
+            statuses = [
+                {"article_status": status, "id": reference_id}
+                for status, reference_id in zip(article_statuses, reference_id)
+            ]
+
+            excel_dict.update(article_status.tail(1).to_dict("records")[0])
 
         article_date = date_completed.loc[
             date_completed["reference_id"].isin(reference_id)
         ]
 
-        if article_date.empty:
-            excel_dict.update(article_date.to_dict())
-        else:
-            excel_dict.update(article_date.tail(1).to_dict("records")[0])
+        if statuses:
+            for status in statuses:
+                status["date_completed"] = next(
+                    iter(
+                        article_date["date_completed"][
+                            article_date["reference_id"] == status["id"]
+                        ].tolist()
+                    ),
+                    None,
+                )
+                status["reviewer"] = next(
+                    iter(
+                        article_date["reviewer"][
+                            article_date["reference_id"] == status["id"]
+                        ].tolist()
+                    ),
+                    None,
+                )
+                if status["article_status"] == "Reviewed":
+                    excel_dict["date_completed"] = article_date["date_completed"][
+                        article_date["reference_id"] == status["id"]
+                    ].tolist()[0]
+
+        excel_dict["reviews"] = statuses
 
         article.update(excel_dict)
 
@@ -137,7 +160,7 @@ class NYTimesSource(object):
         """
         batch = []
         for article in self._get_articles():
-            flatten_article = self._flatten_iteration(article)
+            flatten_article = self._flatten(article)
             combined_article = self._combine_excel(flatten_article)
             batch.append(combined_article)
             if len(batch) >= batch_size:
