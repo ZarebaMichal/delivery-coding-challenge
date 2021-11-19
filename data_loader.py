@@ -1,8 +1,11 @@
 import argparse
+import collections
 import json
 import logging
+from typing import Any, Deque, Dict, List, Tuple, Union
 
 import pandas as pd
+from pandas import DataFrame
 
 """
 Skeleton for Squirro Delivery Hiring Coding Challenge
@@ -11,6 +14,10 @@ August 2021
 
 
 log = logging.getLogger(__name__)
+
+JSON_VALUE = Union[str, int, float, bool, None, List[Any], Dict[str, Any]]
+JSON_TYPE = Dict[str, JSON_VALUE]
+QUEUE = Deque[Tuple[str, JSON_VALUE]]
 
 
 class NYTimesSource(object):
@@ -31,17 +38,21 @@ class NYTimesSource(object):
         # Nothing to do
         pass
 
-    def _flatten_dict(self, data: dict, keystring: str = ""):
-        """Sufficent flattening dict"""
-        if type(data) == dict and len(data) != 0:
-            keystring = keystring + "." if keystring else keystring
-            for k in data:
-                yield from self._flatten_dict(data[k], keystring + str(k))
-        else:
-            yield keystring, data
+    def _flatten_iteration(self, input_dict: JSON_TYPE) -> JSON_TYPE:
+        """Flatten dictionary with '.' separator"""
+        queue: QUEUE = collections.deque([("", input_dict)])
+        output_dict: JSON_TYPE = {}
+        while queue:
+            key, value = queue.popleft()
+            if isinstance(value, dict):
+                prefix = f"{key}." if key else ""
+                queue.extend((f"{prefix}{k}", v) for k, v in value.items())
+            else:
+                output_dict[key] = value
+        return output_dict
 
-    def _combine_excel(self, list_of_articles: list):
-        """Add excel values to all articles"""
+    def _get_excel_sheets(self):
+        """Create dataframes for each sheet in excel."""
         review_status = pd.read_excel(
             self.args.reference_data_file,
             sheet_name="review_status",
@@ -53,7 +64,12 @@ class NYTimesSource(object):
             self.args.reference_data_file, sheet_name="date_completed"
         )
 
-        # Preprocessing data
+        return review_status, date_completed
+
+    def _preprocess_data(
+        self, review_status: DataFrame, date_completed: DataFrame
+    ) -> Tuple[DataFrame, DataFrame]:
+        """Preprocess DataFrames"""
         review_status.columns = review_status.columns.str.replace(" ", "_").str.lower()
         date_completed.columns = date_completed.columns.str.replace(
             " ", "_"
@@ -65,36 +81,52 @@ class NYTimesSource(object):
             str
         )
 
-        for article in list_of_articles:
-            excel_dict = {}
-            article_status = review_status.loc[
-                review_status["article_id"] == article["_id"]
-            ]
-            if len(article_status) > 1:
-                excel_dict["status.duplicates"] = len(article_status)
-                excel_dict["status.duplicates.reference_id"] = article_status[
-                    "reference_id"
-                ].tolist()
+        return review_status, date_completed
 
-            if article_status.empty:
-                excel_dict.update(article_status.to_dict())
-                reference_id = None
-            else:
-                excel_dict.update(article_status.tail(1).to_dict("records")[0])
-                reference_id = article_status["reference_id"].values
+    def _combine_excel(self, article: dict):
+        """Add excel values to article"""
+        review_status, date_completed = self._preprocess_data(*self._get_excel_sheets())
 
-            article_date = date_completed.loc[
-                date_completed["reference_id"].isin(reference_id)
-            ]
+        excel_dict = {}
+        article_status = review_status.loc[
+            review_status["article_id"] == article["_id"]
+        ]
+        if len(article_status) > 1:
+            excel_dict["status.duplicates"] = len(article_status)
+            excel_dict["status.duplicates.reference_id"] = article_status[
+                "reference_id"
+            ].tolist()
 
-            if article_date.empty:
-                excel_dict.update(article_date.to_dict())
-            else:
-                excel_dict.update(article_date.tail(1).to_dict("records")[0])
+        if article_status.empty:
+            excel_dict.update(article_status.to_dict())
+            reference_id = []
+        else:
+            excel_dict.update(article_status.tail(1).to_dict("records")[0])
+            reference_id = article_status["reference_id"].values
 
-            article.update(excel_dict)
+        article_date = date_completed.loc[
+            date_completed["reference_id"].isin(reference_id)
+        ]
 
-        return list_of_articles
+        if article_date.empty:
+            excel_dict.update(article_date.to_dict())
+        else:
+            excel_dict.update(article_date.tail(1).to_dict("records")[0])
+
+        article.update(excel_dict)
+
+        return article
+
+    def _get_articles(self) -> list:
+        """
+        Extract articles from json response.
+
+        :returns List of articles.
+        """
+        with open(self.args.api_response_file) as json_file:
+            data = json.load(json_file)
+
+        return data["response"]["docs"]
 
     def getDataBatch(self, batch_size):
         """
@@ -103,15 +135,16 @@ class NYTimesSource(object):
         :returns One list for each batch. Each of those is a list of
                  dictionaries with the defined rows.
         """
-        with open(self.args.api_response_file) as json_file:
-            data = json.load(json_file)
-
-        list_of_articles = [
-            {k: v for k, v in self._flatten_dict(article)}
-            for article in self._combine_excel(data["response"]["docs"])
-        ]
-        for i in range(0, len(list_of_articles), batch_size):
-            yield list_of_articles[i : i + batch_size]
+        batch = []
+        for article in self._get_articles():
+            flatten_article = self._flatten_iteration(article)
+            combined_article = self._combine_excel(flatten_article)
+            batch.append(combined_article)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
     def getSchema(self):
         """
@@ -119,9 +152,11 @@ class NYTimesSource(object):
         :returns a List containing the names of the columns retrieved from the
         source
         """
-        example_result = self.getDataBatch(10)
-        all_keys = set().union(*(d.keys() for batch in example_result for d in batch))
-        return all_keys
+        batch = next(self.getDataBatch(10), ())
+        fields = set()
+        for entry in batch:
+            fields |= entry.keys()
+        return sorted(fields)
 
 
 if __name__ == "__main__":
