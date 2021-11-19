@@ -140,5 +140,5 @@ if __name__ == "__main__":
         for item in batch:
             # Hint item["status"] and item.get("date_completed") should come from the
             # excel file
-            print(f"{item['_id']} - ")
+            print(f"{item['_id']} - {item['headline.main']}")
             print(f" --> {item['status']} - {item.get('date_completed')}")
